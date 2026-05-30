@@ -56,8 +56,8 @@ err()  { printf "\nERROR: %s\n" "$*" >&2; exit 1; }
 
 human_size() {
   local bytes=$1
-  if   [ "$bytes" -ge 1048576 ]; then printf "%.1f MB" "$(echo "$bytes/1048576" | bc -l)"
-  elif [ "$bytes" -ge 1024 ];    then printf "%.1f KB" "$(echo "$bytes/1024" | bc -l)"
+  if   [ "$bytes" -ge 1048576 ]; then awk -v b="$bytes" 'BEGIN{printf "%.1f MB", b/1048576}'
+  elif [ "$bytes" -ge 1024 ];    then awk -v b="$bytes" 'BEGIN{printf "%.1f MB", b/1024}'
   else printf "%d B" "$bytes"
   fi
 }
