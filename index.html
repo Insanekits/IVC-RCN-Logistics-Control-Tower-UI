@@ -4003,6 +4003,80 @@ tr:hover td{background:#fffdf9}
   align-items:center;
 }
 
+/* ===== Vee Patron AI answer styling ===== */
+.chatThinking{
+  display:inline-block;
+  color:#8a6c3a;
+  font-style:italic;
+  position:relative;
+}
+.chatThinking::after{
+  content:'';
+  display:inline-block;
+  width:1ch;
+  text-align:left;
+  animation:chatDots 1.2s steps(4,end) infinite;
+}
+@keyframes chatDots{
+  0%{content:''} 25%{content:'.'} 50%{content:'..'} 75%{content:'...'} 100%{content:''}
+}
+.floatingChatPanel .chatBubble table.chatTable{
+  border-collapse:collapse;
+  margin:8px 0;
+  font-size:12px;
+  width:100%;
+  background:#fff;
+  border:1px solid #ece2d4;
+  border-radius:10px;
+  overflow:hidden;
+}
+.floatingChatPanel .chatBubble table.chatTable th,
+.floatingChatPanel .chatBubble table.chatTable td{
+  padding:6px 9px;
+  border-bottom:1px solid #f1ece4;
+  text-align:left;
+  white-space:nowrap;
+}
+.floatingChatPanel .chatBubble table.chatTable th{
+  background:#fff7ed;
+  color:#8b5e2f;
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+}
+.floatingChatPanel .chatBubble table.chatTable tr:last-child td{ border-bottom:0 }
+.floatingChatPanel .chatBubble ul{
+  margin:6px 0 6px 18px;
+  padding:0;
+}
+.floatingChatPanel .chatBubble li{ margin:2px 0 }
+.floatingChatPanel .chatBubble code{
+  background:#fff5e6;
+  border:1px solid #f1ddbe;
+  border-radius:6px;
+  padding:1px 5px;
+  font-size:12px;
+}
+.floatingChatPanel .chatBubble pre{
+  background:#1f1a14;
+  color:#fef5e6;
+  border-radius:10px;
+  padding:10px 12px;
+  margin:8px 0;
+  overflow:auto;
+  font-size:12px;
+}
+.floatingChatPanel .chatBubble pre code{
+  background:transparent;
+  border:0;
+  padding:0;
+  color:inherit;
+}
+.floatingChatPanel .chatMeta{
+  /* Highlight the " · AI" suffix subtly when present */
+  white-space:nowrap;
+}
+
 </style>
 </head>
 <body>
@@ -5815,12 +5889,13 @@ function setChatGreeting(force=false){
 
 function addChatMessage(role, text){
   const box = document.getElementById('chatMessages');
-  if(!box) return;
+  if(!box) return null;
   const row = document.createElement('div');
   row.className = `chatRow ${role}`;
   row.innerHTML = `<div class="chatBubble"><div class="chatMeta">${role==='user'?'You':'Vee Patron'}</div>${String(text)}</div>`;
   box.appendChild(row);
   box.scrollTop = box.scrollHeight;
+  return row.querySelector('.chatBubble');
 }
 
 function clearChat(){
@@ -6628,16 +6703,190 @@ function getAnswerForQuestion(rawQuestion){
   }
 }
 
-function submitChat(){
+/* ===== LLM bridge =====
+ * Sends the user's question + a compact, projected slice of the workbook to
+ * /api/chat (a Vercel Edge Function that holds OPENAI_API_KEY). Falls back
+ * silently to the offline vee2* engine on any failure, so the chatbot never
+ * looks broken even with no key configured.
+ */
+const LLM_ENDPOINT = '/api/chat';
+let llmAvailable = true; // flipped off for the session on a 500 (no key configured)
+
+const LLM_CONTEXT_KEYS = [
+  'contract','booking','bl','hbl','client','supplier','pol','pod','destCountry',
+  'vessel','etd','eta','sail','stuffStart','stuffEnd','gateIn','blColl',
+  'qty','netWt','containers','status','shippingLine','forwarder','bookingAgent',
+  'pchRemark','qualityRisk','lds','typeOfBL'
+];
+
+const LLM_STOPWORDS = new Set([
+  'what','which','show','give','tell','me','the','for','of','and','to','in','is','are','a','an',
+  'by','with','wise','details','detail','status','please','pls','how','many','do','does','have',
+  'has','our','their','my','your','will','was','were','can','should','this','that','these','those',
+  'all','any','some','one','two','from','at','on','vs','vee','patron'
+]);
+
+function llmKeywords(question){
+  return Array.from(new Set(
+    norm(question).split(/\s+/).filter(t => t.length >= 3 && !LLM_STOPWORDS.has(t))
+  ));
+}
+
+function projectRowForLlm(r){
+  const out = {};
+  for(const k of LLM_CONTEXT_KEYS){
+    const v = val(r, k);
+    if(v === undefined || v === null) continue;
+    const s = (typeof v === 'string') ? v.trim() : v;
+    if(s === '' || s === 0) continue;
+    out[k] = (typeof s === 'string' && s.length > 80) ? s.slice(0, 80) : s;
+  }
+  return out;
+}
+
+function buildLlmContext(question){
+  if(!Array.isArray(rows) || rows.length === 0){
+    return { totalShipments: 0, note: 'No workbook loaded yet.' };
+  }
+
+  const statusLetters = ['A','B','C','D','E','F','G','H','J','K'];
+  const statusCounts = {};
+  statusLetters.forEach(L => {
+    try { statusCounts[L] = rows.filter(r => statusStarts(r, [L])).length; }
+    catch(_e){ statusCounts[L] = 0; }
+  });
+
+  const totalQty        = qtyOf(rows);
+  const totalContainers = sumContainers(rows);
+  const totalNetWt      = sum(rows, 'netWt');
+
+  const groupBy = (k) => {
+    const map = new Map();
+    for(const r of rows){
+      const v = clean(val(r, k));
+      if(!v) continue;
+      const cur = map.get(v) || { count: 0, qty: 0 };
+      cur.count += 1;
+      cur.qty   += num(val(r, 'qty'));
+      map.set(v, cur);
+    }
+    return Array.from(map, ([name, v]) => ({ name, count: v.count, qty: v.qty }))
+      .sort((a, b) => b.qty - a.qty)
+      .slice(0, 12);
+  };
+
+  const kws = llmKeywords(question);
+  let candidate = rows;
+  if(kws.length){
+    candidate = rows.filter(r => {
+      const blob = LLM_CONTEXT_KEYS.map(k => norm(val(r, k))).join(' ');
+      return kws.some(w => blob.includes(w));
+    });
+  }
+  if(candidate.length === 0) candidate = rows;
+  const sample = candidate.slice(0, 80).map(projectRowForLlm);
+
+  return {
+    totalShipments:    rows.length,
+    matchedShipments:  candidate.length,
+    sampleRowsCount:   sample.length,
+    schema: {
+      statusLetterMeaning: {
+        A:'Not Planned', B:'Planned', C:'Placement', D:'Stuffing',
+        E:'Stuffed-not-gated', F:'Gated', G:'Sailed', H:'BL Received',
+        J:'Destination reached', K:'Trade close'
+      },
+      fieldNotes: 'qty = contract quantity (MT). netWt = net weight (MT). containers = container count. Dates are strings as shown in Excel.'
+    },
+    kpis: {
+      totalQty, totalContainers, totalNetWt,
+      statusCounts,
+      topPods:          groupBy('pod'),
+      topBuyers:        groupBy('client'),
+      topVessels:       groupBy('vessel'),
+      topShippingLines: groupBy('shippingLine'),
+      topForwarders:    groupBy('forwarder')
+    },
+    rows: sample
+  };
+}
+
+async function askLlm(question){
+  if(!llmAvailable) return null;
+  try{
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 28000);
+    const resp = await fetch(LLM_ENDPOINT, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body:    JSON.stringify({ question, context: buildLlmContext(question) }),
+      signal:  ctrl.signal
+    });
+    clearTimeout(timer);
+    if(!resp.ok){
+      if(resp.status === 500){
+        // No key configured / server misconfig - don't retry this session.
+        llmAvailable = false;
+      }
+      return null;
+    }
+    const j = await resp.json();
+    return (j && typeof j.answer === 'string' && j.answer.trim()) ? j.answer : null;
+  } catch(_e){
+    return null;
+  }
+}
+
+function renderChatMarkdown(text){
+  let out = String(text)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  out = out.replace(/```([\s\S]*?)```/g, (_,c)=>`<pre><code>${c}</code></pre>`);
+  out = out.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  out = out.replace(/(^|\n)(\|[^\n]+\|)\n\|[ :\-|]+\|\n((?:\|[^\n]*\|\n?)+)/g, (_m, lead, header, body) => {
+    const heads = header.trim().slice(1,-1).split('|').map(c=>`<th>${c.trim()}</th>`).join('');
+    const tbody = body.trim().split('\n').map(line => {
+      const cells = line.trim().slice(1,-1).split('|').map(c=>`<td>${c.trim()}</td>`).join('');
+      return `<tr>${cells}</tr>`;
+    }).join('');
+    return `${lead}<table class="chatTable"><thead><tr>${heads}</tr></thead><tbody>${tbody}</tbody></table>`;
+  });
+  out = out.replace(/(^|\n)((?:[-*] [^\n]+(?:\n|$))+)/g, (_m, lead, block) => {
+    const items = block.trim().split('\n').map(l => `<li>${l.replace(/^[-*] /, '')}</li>`).join('');
+    return `${lead}<ul>${items}</ul>`;
+  });
+  return out.replace(/\n/g,'<br>');
+}
+
+async function submitChat(){
   const input = document.getElementById('questionInput');
   if(!input) return;
   const q = clean(input.value);
   if(!q) return;
 
   addChatMessage('user', q);
-  const ans = getAnswerForQuestion(q);
-  setTimeout(()=>addChatMessage('bot', ans), 140);
   input.value = '';
+
+  const thinkingBubble = addChatMessage('bot', '<span class="chatThinking">Thinking…</span>');
+
+  let answer = null;
+  let usedLlm = false;
+  try{
+    answer = await askLlm(q);
+    if(answer) usedLlm = true;
+  } catch(_e){ /* fall through to offline */ }
+
+  if(!answer){
+    answer = getAnswerForQuestion(q);
+  }
+
+  if(thinkingBubble){
+    const html = usedLlm ? renderChatMarkdown(answer) : String(answer);
+    thinkingBubble.innerHTML = `<div class="chatMeta">Vee Patron${usedLlm ? ' · AI' : ''}</div>${html}`;
+    const box = document.getElementById('chatMessages');
+    if(box) box.scrollTop = box.scrollHeight;
+  }
 }
 
 

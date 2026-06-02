@@ -39,6 +39,8 @@ valency-onedrive-sync/
 │   ├── sync.ps1             # Windows (PowerShell) equivalent of sync.sh
 │   ├── sync.env.example     # template — copy to sync.env and edit
 │   └── sync.env             # (gitignored) your local config
+├── api/
+│   └── chat.py              # Vercel Python serverless function: OpenAI proxy for Vee Patron
 ├── package.json
 ├── vercel.json
 ├── .gitignore
@@ -198,6 +200,80 @@ The script:
 The dashboard's **Manual upload** button (top right of the banner) is still
 fully functional — use it if you ever need to view a workbook that isn't
 the one on main (e.g. a prior month's file from your downloads).
+
+---
+
+# AI assistant (optional)
+
+The floating **Vee Patron** chatbot can use an OpenAI model to answer free-form
+questions about the workbook ("How many India-bound shipments are still in
+stuffing?", "Which buyer has the most pending BLs?"). If no key is configured,
+the chatbot transparently falls back to its built-in offline rules engine and
+nothing breaks.
+
+## How it works
+
+```
+Browser (index.html)
+   │  POST /api/chat   { question, context: { rows, kpis, ... } }
+   ▼
+Vercel Python serverless function  (api/chat.py)   ←  OPENAI_API_KEY lives ONLY here
+   │  POST api.openai.com/v1/chat/completions
+   ▼
+OpenAI
+   ▼
+back to the browser → rendered as a Vee Patron bubble (with " · AI" tag)
+```
+
+The function uses only the Python standard library (`json`, `os`, `urllib`),
+so there is no `requirements.txt` and Vercel needs no extra build step.
+
+The OpenAI key **never** ships to the browser. It lives only in Vercel's
+environment variables, readable only inside the edge function.
+
+Before each request the browser builds a **compact context**: ~15 useful
+columns × up to 80 keyword-relevant rows + pre-aggregated KPIs (status counts,
+top PODs / buyers / vessels / shipping lines / forwarders). Typical payload
+is 2–6k tokens, so each question costs fractions of a cent on `gpt-4o-mini`.
+
+## Enable it
+
+1. Go to your Vercel project → **Settings → Environment Variables**.
+2. Add:
+   - `OPENAI_API_KEY` = your OpenAI key (Production + Preview).
+   - *(optional)* `OPENAI_MODEL` = e.g. `gpt-4o-mini` (default), `gpt-4o`, `gpt-4.1-mini`.
+3. Redeploy (push any commit or hit **Redeploy** in the dashboard).
+4. Open the dashboard, click the chat bubble, ask something. Answers from
+   the LLM are marked with **"Vee Patron · AI"** in the bubble header.
+
+## Test it locally
+
+```bash
+npm i -g vercel
+vercel link                                            # one-time, links to your Vercel project
+echo "OPENAI_API_KEY=sk-..." > .env.local              # gitignored
+vercel dev                                             # serves index.html + /api/chat on localhost:3000
+```
+
+## Privacy note
+
+When the AI assistant is enabled, the relevant slice of your workbook is sent
+to OpenAI's API with each question. OpenAI's API tier does **not** train on
+API data by default, but if your data is contractually sensitive, confirm
+with whoever owns the data policy before enabling. To turn it off, simply
+delete the `OPENAI_API_KEY` env var in Vercel — the chatbot automatically
+falls back to its offline engine.
+
+## Cold start & timeout note
+
+Python on Vercel runs on the Node.js Lambda-backed serverless runtime
+(Edge functions are JS-only). Practical consequences:
+
+- **Cold start** after several minutes of idle is ~0.5–1.5s. Warm calls
+  are network-bound and identical to the JS edge version.
+- **Execution limit**: 10s on Hobby, 60s on Pro. The function's internal
+  OpenAI timeout is 25s but Hobby will cut it off at 10s — `gpt-4o-mini`
+  comfortably fits inside that for the context sizes this codebase sends.
 
 ---
 
